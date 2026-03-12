@@ -26,9 +26,12 @@
 #include "esp_mac.h"
 #include "esp_now.h"
 #include "esp_crc.h"
+#include "driver/gpio.h"
 #include "espnow_example.h"
 
 #define ESPNOW_MAXDELAY 512
+#define SLAVE_TRIGGER_GPIO GPIO_NUM_0
+#define SLAVE_TRIGGER_DEBOUNCE_MS 120
 
 static const char *TAG = "espnow_example";
 
@@ -36,8 +39,44 @@ static QueueHandle_t s_example_espnow_queue = NULL;
 static const uint8_t s_example_fixed_peer_mac[ESP_NOW_ETH_ALEN] = { 0x10, 0x00, 0x3b, 0xcd, 0xd9, 0xbd };
 static uint16_t s_example_espnow_seq = 0;
 static uint8_t s_example_sta_mac[ESP_NOW_ETH_ALEN] = { 0 };
+static volatile TickType_t s_last_gpio_trigger_tick = 0;
 
 static void example_espnow_deinit(example_espnow_send_param_t *send_param);
+static void example_gpio_init(void);
+
+static void IRAM_ATTR example_gpio_isr_handler(void *arg)
+{
+    (void)arg;
+    BaseType_t high_task_wakeup = pdFALSE;
+    TickType_t now = xTaskGetTickCountFromISR();
+    example_espnow_event_t evt = { .id = EXAMPLE_ESPNOW_GPIO_CB };
+
+    if ((now - s_last_gpio_trigger_tick) < pdMS_TO_TICKS(SLAVE_TRIGGER_DEBOUNCE_MS)) {
+        return;
+    }
+    s_last_gpio_trigger_tick = now;
+
+    xQueueSendFromISR(s_example_espnow_queue, &evt, &high_task_wakeup);
+    if (high_task_wakeup == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+static void example_gpio_init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << SLAVE_TRIGGER_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(SLAVE_TRIGGER_GPIO, example_gpio_isr_handler, NULL));
+    ESP_LOGI(TAG, "GPIO0 trigger enabled (pull-up, active low)");
+}
 
 /* WiFi should start before using ESPNOW */
 static void example_wifi_init(void)
@@ -162,15 +201,7 @@ static void example_espnow_task(void *pvParameter)
     int ret;
     example_espnow_send_param_t *send_param = (example_espnow_send_param_t *)pvParameter;
 
-    vTaskDelay(500 / portTICK_PERIOD_MS);
-    ESP_LOGI(TAG, "Start sending unicast data to fixed peer: "MACSTR, MAC2STR(send_param->dest_mac));
-
-    /* Start sending unicast ESPNOW data to fixed MAC. */
-    if (esp_now_send(send_param->dest_mac, send_param->buffer, send_param->len) != ESP_OK) {
-        ESP_LOGE(TAG, "Send error");
-        example_espnow_deinit(send_param);
-        vTaskDelete(NULL);
-    }
+    ESP_LOGI(TAG, "Waiting for GPIO0 low to send packet to: "MACSTR, MAC2STR(send_param->dest_mac));
 
     while (xQueueReceive(s_example_espnow_queue, &evt, portMAX_DELAY) == pdTRUE) {
         switch (evt.id) {
@@ -178,29 +209,6 @@ static void example_espnow_task(void *pvParameter)
             {
                 example_espnow_event_send_cb_t *send_cb = &evt.info.send_cb;
                 ESP_LOGD(TAG, "Send data to "MACSTR", status: %d", MAC2STR(send_cb->mac_addr), send_cb->status);
-
-                if (send_param->count > 0) {
-                    send_param->count--;
-                }
-                if (send_param->count == 0) {
-                    ESP_LOGI(TAG, "Send done");
-                    example_espnow_deinit(send_param);
-                    vTaskDelete(NULL);
-                }
-
-                /* Delay a while before sending the next data. */
-                if (send_param->delay > 0) {
-                    vTaskDelay(send_param->delay/portTICK_PERIOD_MS);
-                }
-
-                example_espnow_data_prepare(send_param);
-
-                /* Send the next data after the previous data is sent. */
-                if (esp_now_send(send_param->dest_mac, send_param->buffer, send_param->len) != ESP_OK) {
-                    ESP_LOGE(TAG, "Send error");
-                    example_espnow_deinit(send_param);
-                    vTaskDelete(NULL);
-                }
                 break;
             }
             case EXAMPLE_ESPNOW_RECV_CB:
@@ -214,6 +222,22 @@ static void example_espnow_task(void *pvParameter)
                 } else {
                     ESP_LOGI(TAG, "Receive %dth data(type=%d, state=%u, magic=%"PRIu32") from: "MACSTR", len: %d",
                              recv_seq, ret, recv_state, recv_magic, MAC2STR(recv_cb->mac_addr), recv_cb->data_len);
+                }
+                break;
+            }
+            case EXAMPLE_ESPNOW_GPIO_CB:
+            {
+                if (gpio_get_level(SLAVE_TRIGGER_GPIO) != 0) {
+                    break;
+                }
+
+                example_espnow_data_prepare(send_param);
+                if (esp_now_send(send_param->dest_mac, send_param->buffer, send_param->len) != ESP_OK) {
+                    ESP_LOGE(TAG, "Send error");
+                    example_espnow_deinit(send_param);
+                    vTaskDelete(NULL);
+                } else {
+                    ESP_LOGI(TAG, "GPIO0 low -> sent packet to "MACSTR, MAC2STR(send_param->dest_mac));
                 }
                 break;
             }
@@ -233,6 +257,7 @@ static esp_err_t example_espnow_init(void)
         ESP_LOGE(TAG, "Create queue fail");
         return ESP_FAIL;
     }
+    example_gpio_init();
 
     /* Initialize ESPNOW and register sending and receiving callback function. */
     ESP_ERROR_CHECK( esp_now_init() );
@@ -295,6 +320,8 @@ static esp_err_t example_espnow_init(void)
 
 static void example_espnow_deinit(example_espnow_send_param_t *send_param)
 {
+    gpio_isr_handler_remove(SLAVE_TRIGGER_GPIO);
+    gpio_uninstall_isr_service();
     free(send_param->buffer);
     free(send_param);
     vQueueDelete(s_example_espnow_queue);
