@@ -298,8 +298,8 @@ static esp_err_t example_espnow_init(void)
     send_param->broadcast = false;
     send_param->state = 1;
     send_param->magic = esp_random();
-    send_param->count = CONFIG_ESPNOW_SEND_COUNT;
-    send_param->delay = CONFIG_ESPNOW_SEND_DELAY;
+    // send_param->count = CONFIG_ESPNOW_SEND_COUNT;
+    // send_param->delay = CONFIG_ESPNOW_SEND_DELAY;
     send_param->len = CONFIG_ESPNOW_SEND_LEN;
     send_param->buffer = malloc(CONFIG_ESPNOW_SEND_LEN);
     if (send_param->buffer == NULL) {
