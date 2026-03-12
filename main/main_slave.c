@@ -17,6 +17,7 @@
 #include <string.h>
 #include <assert.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/timers.h"
 #include "nvs_flash.h"
 #include "esp_random.h"
 #include "esp_event.h"
@@ -32,10 +33,15 @@
 #define ESPNOW_MAXDELAY 512
 #define SLAVE_TRIGGER_GPIO GPIO_NUM_0
 #define SLAVE_TRIGGER_DEBOUNCE_MS 120
+#define SLAVE_LED_GPIO GPIO_NUM_8
+#define SLAVE_LED_ON_LEVEL 0
+#define SLAVE_LED_OFF_LEVEL 1
+#define SLAVE_LED_ON_MS 1000
 
 static const char *TAG = "espnow_example";
 
 static QueueHandle_t s_example_espnow_queue = NULL;
+static TimerHandle_t s_slave_led_off_timer = NULL;
 static const uint8_t s_example_fixed_peer_mac[ESP_NOW_ETH_ALEN] = { 0x10, 0x00, 0x3b, 0xcd, 0xd9, 0xbd };
 static uint16_t s_example_espnow_seq = 0;
 static uint8_t s_example_sta_mac[ESP_NOW_ETH_ALEN] = { 0 };
@@ -43,6 +49,48 @@ static volatile TickType_t s_last_gpio_trigger_tick = 0;
 
 static void example_espnow_deinit(example_espnow_send_param_t *send_param);
 static void example_gpio_init(void);
+static void example_slave_led_init(void);
+static void example_slave_led_blink(void);
+
+static void example_slave_led_off_timer_cb(TimerHandle_t xTimer)
+{
+    (void)xTimer;
+    gpio_set_level(SLAVE_LED_GPIO, SLAVE_LED_OFF_LEVEL);
+}
+
+static void example_slave_led_init(void)
+{
+    gpio_config_t led_conf = {
+        .pin_bit_mask = 1ULL << SLAVE_LED_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&led_conf));
+    ESP_ERROR_CHECK(gpio_set_level(SLAVE_LED_GPIO, SLAVE_LED_OFF_LEVEL));
+
+    s_slave_led_off_timer = xTimerCreate("slave_led_off",
+                                         pdMS_TO_TICKS(SLAVE_LED_ON_MS),
+                                         pdFALSE,
+                                         NULL,
+                                         example_slave_led_off_timer_cb);
+    if (s_slave_led_off_timer == NULL) {
+        ESP_LOGE(TAG, "Create slave LED timer fail");
+    }
+}
+
+static void example_slave_led_blink(void)
+{
+    if (s_slave_led_off_timer == NULL) {
+        return;
+    }
+
+    ESP_ERROR_CHECK(gpio_set_level(SLAVE_LED_GPIO, SLAVE_LED_ON_LEVEL));
+    xTimerStop(s_slave_led_off_timer, 0);
+    xTimerStart(s_slave_led_off_timer, 0);
+}
 
 static void IRAM_ATTR example_gpio_isr_handler(void *arg)
 {
@@ -214,6 +262,7 @@ static void example_espnow_task(void *pvParameter)
             case EXAMPLE_ESPNOW_RECV_CB:
             {
                 example_espnow_event_recv_cb_t *recv_cb = &evt.info.recv_cb;
+                example_slave_led_blink();
 
                 ret = example_espnow_data_parse(recv_cb->data, recv_cb->data_len, &recv_state, &recv_seq, &recv_magic);
                 free(recv_cb->data);
@@ -320,6 +369,11 @@ static esp_err_t example_espnow_init(void)
 
 static void example_espnow_deinit(example_espnow_send_param_t *send_param)
 {
+    if (s_slave_led_off_timer != NULL) {
+        xTimerStop(s_slave_led_off_timer, portMAX_DELAY);
+        xTimerDelete(s_slave_led_off_timer, portMAX_DELAY);
+        s_slave_led_off_timer = NULL;
+    }
     gpio_isr_handler_remove(SLAVE_TRIGGER_GPIO);
     gpio_uninstall_isr_service();
     free(send_param->buffer);
@@ -339,6 +393,7 @@ void app_main(void)
     }
     ESP_ERROR_CHECK( ret );
 
+    example_slave_led_init();
     ESP_LOGD(TAG, "INIT OF SLAVE APPLICATION");
 
     example_wifi_init();
